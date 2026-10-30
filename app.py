@@ -1,147 +1,208 @@
 import os
 import json
-from typing import List, Optional
-from datetime import datetime
-from pydantic import BaseModel, Field
-from docling.document_converter import DocumentConverter
-from groq import Groq
-from dotenv import load_dotenv  # <--- 1. Import dotenv
+import shutil
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
 
-# Load environment variables from a .env file in the same directory
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv, set_key
+from engine import BookingCalendar, InvoiceWatcherService
+
 load_dotenv()
 
-# ==========================================
-# 1. STANDARDIZED PYDANTIC SCHEMAS
-# ==========================================
-
-class LineItem(BaseModel):
-    description: str = Field(description="Description of the service or item, e.g., 'Deep Cleaning - Apt 4B'")
-    service_date: Optional[str] = Field(None, description="Date the service was performed (YYYY-MM-DD if available)")
-    quantity: Optional[float] = Field(1.0, description="Quantity or hours")
-    unit_price: Optional[float] = Field(None, description="Price per unit")
-    total: float = Field(description="Total line amount")
-
-class UniversalInvoice(BaseModel):
-    supplier_name: str = Field(description="Name of the vendor/supplier issuing the invoice")
-    invoice_number: Optional[str] = Field(description="Invoice ID or number")
-    invoice_date: Optional[str] = Field(description="Date the invoice was issued (YYYY-MM-DD)")
-    currency: str = Field(description="Currency code like USD, AED, EUR")
-    total_amount: float = Field(description="Grand total of the invoice")
-    items: List[LineItem]
-
+app = FastAPI(
+    title="ReconFlow API",
+    description="Automated document reconciliation and audit engine API for short-term rentals.",
+    version="1.1.0"
+)
 
 # ==========================================
-# 2. PDF PARSING & LLM EXTRACTION PIPELINE
+# 1. CORS MIDDLEWARE (ENABLE FRONTEND ACCESS)
 # ==========================================
 
-class InvoiceExtractorPipeline:
-    def __init__(self):
-        # Initialize Docling converter for universal PDF ingestion
-        self.converter = DocumentConverter()
-        # Initialize Groq client
-        self.groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins for local development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    def convert_pdf_to_markdown(self, pdf_path: str) -> str:
-        """Converts any PDF layout into structured markdown using Docling."""
-        print(f"[*] Processing PDF layout with Docling: {pdf_path}")
-        result = self.converter.convert(pdf_path)
-        return result.document.export_to_markdown()
 
-    def extract_structured_data(self, markdown_text: str) -> UniversalInvoice:
-        """Sends layout markdown to Groq to extract clean, standardized JSON matching our schema."""
-        print("[*] Extracting structured entities via LLM...")
+# ==========================================
+# 2. DIRECTORIES & INITIALIZATION
+# ==========================================
+
+BASE_DIR = Path(__file__).parent
+INBOX_DIR = BASE_DIR / "inbox"
+PROCESSED_DIR = BASE_DIR / "processed"
+FLAGGED_DIR = BASE_DIR / "flagged"
+REPORTS_DIR = BASE_DIR / "reports"
+ENV_FILE = BASE_DIR / ".env"
+
+for folder in [INBOX_DIR, PROCESSED_DIR, FLAGGED_DIR, REPORTS_DIR]:
+    folder.mkdir(exist_ok=True)
+
+# Initialize engine services
+service = InvoiceWatcherService()
+
+try:
+    calendar = BookingCalendar.from_env()
+    calendar.refresh(force=True)
+except Exception as e:
+    print(f"[-] Warning initializing calendar feeds: {e}")
+    calendar = None
+
+
+# ==========================================
+# 3. REQUEST / RESPONSE SCHEMAS
+# ==========================================
+
+class CalendarConfigUpdate(BaseModel):
+    listing_name: str
+    ical_url: str
+
+
+# ==========================================
+# 4. API ENDPOINTS
+# ==========================================
+
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "message": "Audit Engine API is active. Go to /docs for interactive Swagger UI testing."
+    }
+
+
+@app.post("/audit-invoice/")
+async def audit_invoice_endpoint(file: UploadFile = File(...)):
+    """
+    Upload a cleaning invoice PDF. The API will parse it via Docling,
+    fetch the latest iCal dates, cross-check for discrepancies, and return the audit report.
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF document files are supported.")
+
+    # Save uploaded file temporarily to inbox
+    temp_pdf_path = INBOX_DIR / file.filename
+    try:
+        with open(temp_pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Fetch latest iCal dates on-demand
+        valid_dates = calendar.valid_dates() if calendar else []
+
+        # Parse invoice data via Docling & Groq
+        invoice_data = service.extract_invoice_data(temp_pdf_path)
+
+        # Audit line items against booking calendar
+        flags = service.audit_invoice(invoice_data, valid_dates)
+
+        # Save JSON report
+        status = "FLAGGED" if flags else "PASSED"
+        report_data = {
+            "file_name": file.filename,
+            "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status,
+            "invoice": invoice_data.model_dump(),
+            "discrepancies": flags,
+        }
+        report_file = REPORTS_DIR / f"{temp_pdf_path.stem}_report.json"
+        report_file.write_text(json.dumps(report_data, indent=2), encoding="utf-8")
+
+        # Route file to processed or flagged folder
+        dest_dir = FLAGGED_DIR if flags else PROCESSED_DIR
+        target_path = dest_dir / file.filename
+        if target_path.exists():
+            target_path = dest_dir / f"{temp_pdf_path.stem}_{int(time.time())}{temp_pdf_path.suffix}"
         
-        # We prompt the LLM to output valid JSON matching our schema fields
-        schema_json_str = json.dumps(UniversalInvoice.model_json_schema(), indent=2)
-        
-        prompt = f"""
-You are an expert invoice data extractor. Extract the invoice details from the markdown below into strict JSON format matching this JSON schema:
+        shutil.move(str(temp_pdf_path), str(target_path))
 
-{schema_json_str}
+        return {
+            "status": status,
+            "file_name": file.filename,
+            "routed_to": str(target_path.relative_to(BASE_DIR)),
+            "invoice_summary": invoice_data.model_dump(),
+            "discrepancies": flags
+        }
 
-Markdown Content:
-{markdown_text}
-"""
-
-        completion = self.groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[
-                {"role": "system", "content": "You extract invoice data accurately into JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={"type": "json_object"}
-        )
-
-        raw_json_output = completion.choices[0].message.content
-        parsed_data = json.loads(raw_json_output)
-        
-        return UniversalInvoice(**parsed_data)
+    except Exception as e:
+        if temp_pdf_path.exists():
+            temp_pdf_path.unlink()
+        raise HTTPException(status_code=500, detail=f"Pipeline processing error: {str(e)}")
 
 
-# ==========================================
-# 3. RECONCILIATION / DISCREPANCY ENGINE
-# ==========================================
-
-class BookingReconciler:
-    @staticmethod
-    def audit_cleaning_invoice(invoice: UniversalInvoice, mock_booking_dates: List[str]) -> List[str]:
-        """
-        Cross-checks invoice line items against actual property booking dates.
-        mock_booking_dates would normally come from your Airbnb iCal or database query.
-        """
-        discrepancies = []
-        print(f"\n[*] Auditing Invoice {invoice.invoice_number} from {invoice.supplier_name}...")
-        
-        for item in invoice.items:
-            # If the invoice line item specifies a service date, check if a guest stayed that night
-            if item.service_date:
-                if item.service_date not in mock_booking_dates:
-                    discrepancies.append(
-                        f"[FLAG] Billed cleaning on {item.service_date} for '{item.description}' "
-                        f"({invoice.currency} {item.total}), but NO matching booking was found in the calendar!"
-                    )
-                else:
-                    print(f"[PASS] Verified booking for date: {item.service_date}")
-            else:
-                discrepancies.append(
-                    f"[WARNING] Line item '{item.description}' has no explicit service date to cross-check."
-                )
-                
-        return discrepancies
+@app.get("/api/folders/")
+def list_folder_contents():
+    """
+    Returns files currently stored across inbox, processed, flagged, and reports directories.
+    """
+    return {
+        "inbox": [f.name for f in INBOX_DIR.glob("*.pdf")],
+        "processed": [f.name for f in PROCESSED_DIR.glob("*.pdf")],
+        "flagged": [f.name for f in FLAGGED_DIR.glob("*.pdf")],
+        "reports": [f.name for f in REPORTS_DIR.glob("*.json")],
+    }
 
 
-# ==========================================
-# 4. EXECUTION FLOW
-# ==========================================
+@app.get("/api/reports/{filename}")
+def get_report_detail(filename: str):
+    """
+    Retrieves the detailed JSON audit report for a specific document.
+    """
+    if not filename.endswith(".json"):
+        filename += "_report.json"
 
-if __name__ == "__main__":
-    # Path to your messy supplier or cleaning invoice PDF
-    pdf_file_path = "invoice.pdf" 
+    report_file = REPORTS_DIR / filename
+    if not report_file.exists():
+        raise HTTPException(status_code=404, detail=f"Report file '{filename}' not found.")
     
-    if not os.path.exists(pdf_file_path):
-        print(f"Error: {pdf_file_path} not found. Place a sample PDF in the directory to run.")
-    else:
-        # Initialize pipeline
-        pipeline = InvoiceExtractorPipeline()
-        
-        # Step 1: Docling extracts layout text/markdown from the arbitrary PDF
-        markdown_doc = pipeline.convert_pdf_to_markdown(pdf_file_path)
-        
-        # Step 2: LLM normalizes the messy text into our clean Pydantic model
-        structured_invoice = pipeline.extract_structured_data(markdown_doc)
-        
-        print("\n--- Successfully Normalized Invoice Data ---")
-        print(json.dumps(structured_invoice.model_dump(), indent=2))
-        
-        # Step 3: Cross-reference with your operational system (e.g., Airbnb calendar data)
-        # In production, query your database or iCal feed for actual guest check-out/stay dates
-        simulated_calendar_bookings = ["2026-07-30", "2026-07-31", "2026-08-01"]
-        
-        flags = BookingReconciler.audit_cleaning_invoice(structured_invoice, simulated_calendar_bookings)
-        
-        print("\n--- Audit Results & Discrepancies ---")
-        if flags:
-            for flag in flags:
-                print(flag)
+    return json.loads(report_file.read_text(encoding="utf-8"))
+
+
+@app.post("/api/calendar/config/")
+def update_calendar_config(config: CalendarConfigUpdate):
+    """
+    Update or add an iCal URL for a property listing and reload calendar feeds in memory.
+    """
+    global calendar
+    try:
+        current_env_val = os.environ.get("AIRBNB_ICAL_URLS", "")
+        new_entry = f"{config.listing_name}={config.ical_url}"
+
+        if not current_env_val:
+            updated_val = new_entry
+        elif config.listing_name in current_env_val:
+            # Replace existing property URL entry
+            parts = [p.strip() for p in current_env_val.split(";") if p.strip()]
+            new_parts = []
+            for p in parts:
+                if "=" in p and p.split("=", 1)[0].strip() == config.listing_name:
+                    new_parts.append(new_entry)
+                else:
+                    new_parts.append(p)
+            updated_val = ";".join(new_parts)
         else:
-            print("All line items successfully matched your booking calendar!")
+            updated_val = f"{current_env_val};{new_entry}"
+
+        # Update environment variable and save to .env
+        os.environ["AIRBNB_ICAL_URLS"] = updated_val
+        if ENV_FILE.exists():
+            set_key(str(ENV_FILE), "AIRBNB_ICAL_URLS", updated_val)
+
+        # Refresh calendar instance
+        calendar = BookingCalendar.from_env()
+        calendar.refresh(force=True)
+
+        return {
+            "status": "success",
+            "message": f"Updated calendar config for '{config.listing_name}'",
+            "active_dates_count": len(calendar.valid_dates())
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update calendar configuration: {str(e)}")
