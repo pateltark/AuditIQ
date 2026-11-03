@@ -32,6 +32,8 @@ export interface Api {
   audit(file: File): Promise<AuditStatus>
   folders(): Promise<Folders>
   report(name: string): Promise<Report>
+  openFile(folder: FolderName, name: string): Promise<void>
+  deleteFile(folder: FolderName, name: string): Promise<string[]>
 }
 
 export interface Toast {

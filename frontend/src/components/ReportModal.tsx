@@ -1,15 +1,15 @@
 import { useEffect, useState } from 'react'
 import { fmtMoney, pick } from '../lib'
-import type { Api, Report } from '../types'
+import type { Api, FolderName, Report } from '../types'
 import { Badge } from './ui'
 
-interface Props { api: Api; name: string; title: string; onClose: () => void }
+interface Props { api: Api; name: string; title: string; onClose: () => void; onOpenPdf: (folder: FolderName, name: string) => void }
 type Disc = string | Record<string, any>
 
 const reason = (d: Disc): string => (typeof d === 'string' ? d : pick(d, ['reason', 'message', 'issue', 'detail', 'description']) ?? JSON.stringify(d))
 const dDate = (d: Disc) => (typeof d === 'string' ? undefined : pick(d, ['date', 'service_date']))
 
-export function ReportModal({ api, name, title, onClose }: Props) {
+export function ReportModal({ api, name, title, onClose, onOpenPdf }: Props) {
   const [report, setReport] = useState<Report | null>(null)
   const [error, setError] = useState('')
 
@@ -46,9 +46,15 @@ export function ReportModal({ api, name, title, onClose }: Props) {
             <h3 id="report-title" className="truncate text-base font-semibold">{title}</h3>
             {report && <div className="mt-1"><Badge status={flagged ? 'flagged' : 'passed'} /></div>}
           </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {report && (
+              <button onClick={() => onOpenPdf(flagged ? 'flagged' : 'processed', report.file_name)}
+                className="rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium hover:bg-slate-50">Open PDF</button>
+            )}
           <button onClick={onClose} aria-label="Close" className="rounded-md p-1 text-slate-500 hover:bg-slate-100">
             <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18" /></svg>
           </button>
+          </div>
         </div>
 
         <div className="space-y-6 px-6 py-5">

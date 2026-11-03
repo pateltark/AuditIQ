@@ -206,3 +206,62 @@ def update_calendar_config(config: CalendarConfigUpdate):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update calendar configuration: {str(e)}")
+
+
+
+
+import os
+import secrets
+from typing import Optional
+
+from fastapi import Depends, Header, HTTPException
+from fastapi.responses import FileResponse
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None)):
+    """No-op unless RECONFLOW_API_KEY is set, so local development keeps working."""
+    expected = os.getenv("RECONFLOW_API_KEY")
+    if expected and not secrets.compare_digest(x_api_key or "", expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+# ---- paste below the existing routes ----
+
+FOLDERS = {"inbox": INBOX_DIR, "processed": PROCESSED_DIR, "flagged": FLAGGED_DIR, "reports": REPORTS_DIR}
+
+
+def resolve_file(folder: str, filename: str):
+    """Map (folder, filename) to a real file, refusing anything outside that folder."""
+    base = FOLDERS.get(folder)
+    if base is None:
+        raise HTTPException(status_code=404, detail="Unknown folder.")
+    path = (base / os.path.basename(filename)).resolve()
+    suffix = ".json" if folder == "reports" else ".pdf"
+    if path.parent != base.resolve() or path.suffix.lower() != suffix or not path.is_file():
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found in {folder}.")
+    return path
+
+
+@app.get("/api/files/{folder}/{filename}")
+def get_file(folder: str, filename: str):
+    """Stream a PDF (inline, so browsers preview it) or a report JSON."""
+    path = resolve_file(folder, filename)
+    if path.suffix.lower() == ".pdf":
+        return FileResponse(path, media_type="application/pdf", filename=path.name, content_disposition_type="inline")
+    return FileResponse(path, media_type="application/json")
+
+
+@app.delete("/api/files/{folder}/{filename}")
+def delete_file(folder: str, filename: str):
+    """Delete a file. Deleting a processed/flagged PDF also deletes its audit report."""
+    if folder == "inbox":
+        raise HTTPException(status_code=409, detail="Inbox files are being processed and cannot be deleted.")
+    path = resolve_file(folder, filename)
+    deleted = [path.name]
+    path.unlink()
+    if folder in ("processed", "flagged"):
+        report = REPORTS_DIR / f"{path.stem}_report.json"
+        if report.is_file():
+            report.unlink()
+            deleted.append(report.name)
+    return {"deleted": deleted}
